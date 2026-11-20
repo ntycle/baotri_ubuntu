@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# NGINX MAINTENANCE TOOLKIT (v9)
+# NGINX MAINTENANCE TOOLKIT (v13)
 # Ubuntu 24.04+ / Debian-based systems / APT Nginx packages
 #
 # Commands:
@@ -23,6 +23,44 @@
 #   explicit check (safety copy, backup path validation). The "nginx -T"
 #   stderr warning ignores nginx's normal "syntax is ok / test is
 #   successful" lines, which are printed on every successful run.
+#
+# v10 changes (on top of v9):
+# - Old log files are pruned at every start (init_log), so read-only
+#   commands such as "health" run from cron cannot fill LOG_ROOT.
+# - Log flush on exit is deterministic: the EXIT trap closes stdout/stderr
+#   and waits for the tee process instead of sleeping a fixed time. The
+#   script's exit status is preserved.
+# - APT hold check no longer pipes into "grep -q" under pipefail.
+# - File is stored with LF line endings. Keep it that way (CRLF breaks bash).
+#
+# v11 changes (on top of v10):
+# - finish_log can no longer hang: if a stray background child still holds
+#   the log pipe open, a 5 s watchdog stops tee. The watchdog closes the
+#   lock fd, so it can never keep the lock held after the script exits.
+# - Read-only commands (health, list) write to their own log class
+#   (Log-<tool>-readonly-*) with their own retention. A frequent cron
+#   "health" can therefore never evict the logs of backup/upgrade/rollback.
+#
+# v12 changes (on top of v11):
+# - "health" and "list" no longer take the exclusive lock. They change
+#   nothing, so a cron "health" cannot be refused (false alarm) because a
+#   backup/upgrade/rollback is running. If a maintenance run is in
+#   progress, health says so in its log: results can be transient while
+#   Nginx is being upgraded or its config is being swapped.
+# - The interactive menu only collects the choice. The run is then locked
+#   and logged exactly like the direct command, so menu "health" and
+#   "list" go to the read-only log class too. The selection is logged.
+# - Stale comment in main() corrected.
+#
+# v13 changes (on top of v12):
+# - The "is a maintenance run active?" probe takes a SHARED lock (flock -s).
+#   An exclusive probe made two concurrent health runs report each other as
+#   "busy" and could collide with a starting backup.
+# - acquire_lock waits up to LOCK_WAIT seconds (flock -w) instead of failing
+#   at once. A cron backup that starts in the same second as a cron health
+#   is no longer refused because of that health's few-millisecond probe; a
+#   real concurrent maintenance run still holds the lock far longer and is
+#   still refused.
 #
 # IMPORTANT:
 # - This is not a zero-downtime upgrade guarantee. APT package
@@ -47,10 +85,12 @@ LOCK_FILE="/var/lock/${TOOL_NAME}.lock"
 KEEP_BACKUPS=10
 KEEP_INVALID_BACKUPS=3   # CONFIG_INVALID backups are counted separately
 KEEP_LOGS=30
+LOCK_WAIT=3             # seconds a maintenance run waits for a momentary (shared) probe lock
 
 RUN_TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 CURRENT_LOG=""
 CURRENT_BACKUP=""
+TEE_PID=""
 EXIT_CODE=0
 
 # Optional: space-separated TCP ports that "health" must find owned by
@@ -93,18 +133,70 @@ acquire_lock() {
     require_commands flock
     mkdir -p "$(dirname "$LOCK_FILE")"
     exec 9>"$LOCK_FILE"
-    flock -n 9 || die "Another ${TOOL_NAME} instance is already running."
+    flock -w "$LOCK_WAIT" 9 || die "Another ${TOOL_NAME} instance is already running."
+}
+
+# Read-only commands (health, list) do not take the exclusive lock. This only
+# reports whether a maintenance run currently holds it (prints 1) or not
+# (prints 0). The probe is a SHARED lock: probes never conflict with each
+# other, and a starting maintenance run just waits it out (see acquire_lock).
+maintenance_busy() {
+    require_commands flock
+    mkdir -p "$(dirname "$LOCK_FILE")"
+    if ( exec 9>"$LOCK_FILE" && flock -n -s 9 ) 2>/dev/null; then
+        echo 0
+    else
+        echo 1
+    fi
+}
+
+# Read-only commands get their own log class so that frequent runs (a cron
+# "health" every few minutes) never push audit-relevant logs of backup,
+# upgrade or rollback runs out of retention.
+log_prefix_for() {
+    case "$1" in
+        health|list) printf 'Log-%s-readonly-' "$TOOL_NAME" ;;
+        *)           printf 'Log-%s-' "$TOOL_NAME" ;;
+    esac
+}
+
+prune_logs() {
+    prune_old "$LOG_ROOT" "Log-${TOOL_NAME}-[0-9]*.txt" f "$KEEP_LOGS"
+    prune_old "$LOG_ROOT" "Log-${TOOL_NAME}-readonly-*.txt" f "$KEEP_LOGS"
 }
 
 init_log() {
+    local prefix
+    prefix="$(log_prefix_for "${1:-}")"
     ensure_private_dir "$LOG_ROOT"
-    CURRENT_LOG="${LOG_ROOT}/Log-${TOOL_NAME}-${RUN_TIMESTAMP}.txt"
+    CURRENT_LOG="${LOG_ROOT}/${prefix}${RUN_TIMESTAMP}.txt"
     if [[ -e "$CURRENT_LOG" ]]; then
-        CURRENT_LOG="${LOG_ROOT}/Log-${TOOL_NAME}-${RUN_TIMESTAMP}-$$.txt"
+        CURRENT_LOG="${LOG_ROOT}/${prefix}${RUN_TIMESTAMP}-$$.txt"
     fi
     touch "$CURRENT_LOG"
     exec > >(tee -a "$CURRENT_LOG") 2>&1
+    TEE_PID=$!
     log "Log file: $CURRENT_LOG"
+    # Every command creates a log file, so retention must not depend on
+    # backup/rollback succeeding. The current (newest) log is always kept.
+    prune_logs
+}
+
+# EXIT trap: let tee write out everything, then exit with the original status.
+finish_log() {
+    local rc=$? watchdog=""
+    trap - EXIT
+    if [[ -n "$TEE_PID" ]]; then
+        exec >&- 2>&- || true
+        # tee ends once every writer has closed the pipe. A stray background
+        # child that still holds it must not hang the script (and its lock),
+        # so a watchdog stops tee after 5 s. It closes fd 9 (the lock).
+        ( exec 9>&-; sleep 5; kill "$TEE_PID" 2>/dev/null ) >/dev/null 2>&1 &
+        watchdog=$!
+        wait "$TEE_PID" 2>/dev/null || true
+        kill "$watchdog" 2>/dev/null || true
+    fi
+    exit "$rc"
 }
 
 new_timestamp() {
@@ -205,7 +297,7 @@ prune_backups() {
 prune_all() {
     prune_backups
     prune_old "$BACKUP_ROOT" 'before-rollback-*' d "$KEEP_BACKUPS"
-    prune_old "$LOG_ROOT" "Log-${TOOL_NAME}-*.txt" f "$KEEP_LOGS"
+    prune_logs
 }
 
 # Reload when running; start when stopped (a stopped Nginx is a common
@@ -441,17 +533,19 @@ backup() {
 # NOTE: called as "check_upgrade_plan || plan_rc=$?", so set -e is
 # ignored inside; every critical command must check its own result.
 check_upgrade_plan() {
-    local simulation answer
+    local simulation answer held
 
     log "Refreshing APT package lists..."
     apt-get update || die "apt-get update failed. No upgrade was performed."
 
     log "Current and candidate Nginx package versions:"
     apt-cache policy nginx || true
-    if command -v apt-mark >/dev/null 2>&1 \
-        && apt-mark showhold 2>/dev/null | grep -Eqx 'nginx(-common)?'; then
-        log "WARNING: nginx or nginx-common is on APT hold; APT will not upgrade it."
-        log "         Release it with: apt-mark unhold nginx nginx-common"
+    if command -v apt-mark >/dev/null 2>&1; then
+        held="$(apt-mark showhold 2>/dev/null || true)"
+        if grep -Eqx 'nginx(-common)?' <<<"$held"; then
+            log "WARNING: nginx or nginx-common is on APT hold; APT will not upgrade it."
+            log "         Release it with: apt-mark unhold nginx nginx-common"
+        fi
     fi
 
     log "Simulating Nginx upgrade (no package changes will be made)..."
@@ -793,11 +887,17 @@ rollback() {
     return "$rc"
 }
 
-menu() {
+# Collects the interactive choice only. It runs BEFORE the lock and the log
+# are set up, so that main() can treat the choice like a direct command
+# (correct lock behaviour, correct log class).
+MENU_CMD=""
+MENU_ARGS=()
+
+menu_choose() {
     local choice url dir
     echo
     echo "======================================"
-    echo " NGINX MAINTENANCE TOOLKIT (v9)"
+    echo " NGINX MAINTENANCE TOOLKIT (v13)"
     echo "======================================"
     echo "1) Backup configuration"
     echo "2) Upgrade Nginx (backup + simulation + confirmation)"
@@ -809,27 +909,20 @@ menu() {
     read -r -p "Select: " choice || die "No input received."
 
     case "$choice" in
-        1) backup ;;
-        2) upgrade ;;
+        1) MENU_CMD="backup" ;;
+        2) MENU_CMD="upgrade" ;;
         3)
+            MENU_CMD="health"
             read -r -p "Optional URL to check (Enter to skip): " url || url=""
-            # Show full output, but keep the real result for the final exit code.
-            if [[ -n "$url" ]]; then
-                health "$url" || EXIT_CODE=$?
-            else
-                health || EXIT_CODE=$?
-            fi
+            [[ -z "$url" ]] || MENU_ARGS=("$url")
             ;;
-        4) list_backups ;;
+        4) MENU_CMD="list" ;;
         5)
+            MENU_CMD="rollback"
             list_backups
             echo
             read -r -p "Backup name or path (Enter = latest valid): " dir || dir=""
-            if [[ -n "$dir" ]]; then
-                rollback "$dir" || EXIT_CODE=$?
-            else
-                rollback || EXIT_CODE=$?
-            fi
+            [[ -z "$dir" ]] || MENU_ARGS=("$dir")
             ;;
         0) exit 0 ;;
         *) die "Invalid selection." ;;
@@ -838,7 +931,7 @@ menu() {
 
 usage() {
     cat <<EOF
-NGINX MAINTENANCE TOOLKIT (v9)
+NGINX MAINTENANCE TOOLKIT (v13)
 
 Usage:
   sudo $0 backup
@@ -858,18 +951,36 @@ EOF
 }
 
 main() {
-    local cmd="${1:-menu}"
+    local cmd="${1:-menu}" busy=0
 
     case "$cmd" in
         -h|--help|help) usage; exit 0 ;;
     esac
 
     require_root
-    acquire_lock
-    init_log
-    # tee runs asynchronously; give it a moment to flush the last lines.
-    # The exit status of the script is preserved.
-    trap 'sleep 0.3' EXIT
+
+    # Menu: only collect the choice here; then continue as if the user had
+    # typed the command (arguments included) on the command line.
+    if [[ "$cmd" == "menu" ]]; then
+        menu_choose
+        cmd="$MENU_CMD"
+        set -- "$cmd" ${MENU_ARGS[@]+"${MENU_ARGS[@]}"}
+    fi
+
+    case "$cmd" in
+        health|list) busy="$(maintenance_busy)" ;;
+        *)           acquire_lock ;;
+    esac
+    init_log "$cmd"
+    # tee runs asynchronously; finish_log waits for it so the last lines
+    # always reach the log file. The exit status is preserved.
+    trap finish_log EXIT
+
+    [[ -z "$MENU_CMD" ]] || log "Selected from menu: $cmd"
+    if [[ "$busy" -eq 1 ]]; then
+        log "NOTE: a maintenance run (backup/upgrade/rollback) is in progress."
+        log "      Results below may be transient while Nginx or its config is being changed."
+    fi
 
     case "$cmd" in
         backup)   backup ;;
@@ -877,7 +988,6 @@ main() {
         health)   shift; health "$@" || EXIT_CODE=$? ;;
         list)     list_backups ;;
         rollback) shift; rollback "${1:-}" || EXIT_CODE=$? ;;
-        menu)     menu ;;
         *)        usage; die "Unknown command: $cmd" ;;
     esac
 
