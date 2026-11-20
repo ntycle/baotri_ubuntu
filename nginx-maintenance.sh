@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# NGINX MAINTENANCE TOOLKIT (v13)
+# NGINX MAINTENANCE TOOLKIT (v14)
 # Ubuntu 24.04+ / Debian-based systems / APT Nginx packages
 #
 # Commands:
@@ -62,6 +62,23 @@
 #   real concurrent maintenance run still holds the lock far longer and is
 #   still refused.
 #
+# v14 changes (on top of v13):
+# - "health URL" now checks TWO paths and tells them apart:
+#     origin : curl --resolve HOST:PORT:<origin-ip>  (default 127.0.0.1),
+#              no redirects followed, Cloudflare bypassed;
+#     public : the URL as visitors/Cloudflare see it (redirects followed).
+#   The verdict separates (1) an origin fault (Nginx/PHP-FPM/WordPress) from
+#   (2) a Cloudflare challenge/WAF block of the probe (origin is fine) and
+#   (3) Cloudflare 52x (origin fine locally, but Cloudflare cannot use it).
+# - Exit status of "health": problems with the origin, or with the public
+#   path for real visitors (52x, connection failure, other HTTP errors),
+#   count as failures. A Cloudflare challenge/WAF block of the probe while
+#   the origin is healthy is only a warning (status 0): it is not an outage.
+# - New: --origin-ip, --no-origin, --insecure-origin, HEALTH_URLS (also used
+#   by the check at the end of "upgrade"), HEALTH_ORIGIN_IP,
+#   HEALTH_ORIGIN_INSECURE, HEALTH_ORIGIN_CACERT (Cloudflare Origin CA certs
+#   are not publicly trusted: use one of the last two for them).
+#
 # IMPORTANT:
 # - This is not a zero-downtime upgrade guarantee. APT package
 #   maintainer scripts may reload/restart Nginx during installation.
@@ -97,6 +114,20 @@ EXIT_CODE=0
 # Nginx, e.g. HEALTH_PORTS="80 443" or HEALTH_PORTS="8080".
 # If empty, health only requires some TCP listener owned by an nginx process.
 HEALTH_PORTS="${HEALTH_PORTS:-}"
+
+# HTTP health checks (see "health"):
+#   HEALTH_URLS            space-separated URLs checked when none are given
+#   HEALTH_ORIGIN_IP       address of the origin for the direct check
+#   HEALTH_ORIGIN_INSECURE 1 = do not verify the origin TLS certificate
+#   HEALTH_ORIGIN_CACERT   CA file used to verify the origin certificate
+HEALTH_URLS="${HEALTH_URLS:-}"
+HEALTH_ORIGIN_IP="${HEALTH_ORIGIN_IP:-127.0.0.1}"
+HEALTH_ORIGIN_INSECURE="${HEALTH_ORIGIN_INSECURE:-0}"
+HEALTH_ORIGIN_CACERT="${HEALTH_ORIGIN_CACERT:-}"
+
+URL_SCHEME=""; URL_HOST=""; URL_PORT=""
+PUB_CODE=""; PUB_RC=0; PUB_CLASS=""
+ORIGIN_CODE=""; ORIGIN_RC=0
 
 # Never fails: a dead log pipe (e.g. SSH dropped) must not abort the
 # script, least of all in the middle of a rollback.
@@ -628,7 +659,10 @@ upgrade() {
         log "WARNING: health check reported problems."
         EXIT_CODE=1
     fi
-    log "For website checks run: $0 health https://your-domain.example"
+    if [[ -z "$HEALTH_URLS" ]]; then
+        log "No website was checked. Set HEALTH_URLS or run: $0 health https://your-domain.example"
+        log "(checks the origin directly via --resolve and the public/Cloudflare path separately)"
+    fi
     log "Backup used for this upgrade: $CURRENT_BACKUP"
 }
 
@@ -667,9 +701,251 @@ check_listeners() {
     printf '%s\n' "$nginx_listeners"
 }
 
+# ---------- HTTP checks: origin (--resolve) + public (Cloudflare) ----------
+
+# Splits an http(s) URL into URL_SCHEME / URL_HOST / URL_PORT.
+# Fails for anything without a plain DNS host name (IPv6 literals, user:pass@).
+parse_url() {
+    local url="$1" rest hostport
+    case "$url" in
+        https://*) URL_SCHEME="https"; rest="${url#https://}"; URL_PORT=443 ;;
+        http://*)  URL_SCHEME="http";  rest="${url#http://}";  URL_PORT=80 ;;
+        *) return 1 ;;
+    esac
+    hostport="${rest%%[/?#]*}"
+    [[ -n "$hostport" && "$hostport" != *@* ]] || return 1
+    if [[ "$hostport" == *:* ]]; then
+        URL_HOST="${hostport%%:*}"
+        URL_PORT="${hostport##*:}"
+        [[ "$URL_PORT" =~ ^[0-9]+$ ]] || return 1
+    else
+        URL_HOST="$hostport"
+    fi
+    [[ "$URL_HOST" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || return 1
+}
+
+# A direct origin check is pointless when the URL already names an address.
+host_is_ip() {
+    [[ "$1" =~ ^[0-9]+(\.[0-9]+){3}$ || "$1" == "localhost" ]]
+}
+
+curl_rc_text() {
+    case "$1" in
+        6)  echo "DNS lookup failed" ;;
+        7)  echo "connection refused" ;;
+        28) echo "timed out" ;;
+        35|52|56) echo "TLS handshake/connection error" ;;
+        51|58|59|60|77|83|91) echo "TLS certificate not trusted" ;;
+        *)  echo "curl exit code $1" ;;
+    esac
+}
+
+# Why the origin check failed, in words (uses ORIGIN_RC / ORIGIN_CODE).
+origin_failure_text() {
+    if [[ "$ORIGIN_RC" -ne 0 ]]; then
+        case "$ORIGIN_RC" in
+            7)  echo "connection refused on ${HEALTH_ORIGIN_IP}: Nginx is not listening there (use --origin-ip if it listens on another address)" ;;
+            28) echo "timed out: Nginx or the upstream does not answer" ;;
+            51|58|59|60|77|83|91)
+                echo "TLS certificate not trusted: for a Cloudflare Origin CA certificate use --insecure-origin or HEALTH_ORIGIN_CACERT" ;;
+            *)  echo "$(curl_rc_text "$ORIGIN_RC")" ;;
+        esac
+        return 0
+    fi
+    case "$ORIGIN_CODE" in
+        400|403) echo "HTTP ${ORIGIN_CODE}: can also be Authenticated Origin Pulls or an allow-list limited to Cloudflare IPs, not necessarily a fault" ;;
+        500)     echo "HTTP 500: PHP/WordPress error" ;;
+        502|503|504) echo "HTTP ${ORIGIN_CODE}: Nginx is up but the upstream (PHP-FPM) failed or is overloaded" ;;
+        *)       echo "HTTP ${ORIGIN_CODE}" ;;
+    esac
+}
+
+# Direct request to the origin: the real host name in the URL (so SNI, Host
+# header and certificate checks are genuine), but resolved to the origin
+# address. Redirects are NOT followed: a redirect is an origin answer, and
+# following it would leave through public DNS (i.e. through Cloudflare).
+# Sets ORIGIN_CODE / ORIGIN_RC.
+origin_probe() {
+    local url="$1" host="$2" port="$3" tmp="$4" addr="$HEALTH_ORIGIN_IP"
+    local args=()
+    if [[ "$addr" == *:* && "$addr" != \[* ]]; then
+        addr="[${addr}]"
+    fi
+    args=(--silent --show-error --output /dev/null
+          --connect-timeout 10 --max-time 30
+          --resolve "${host}:${port}:${addr}" --write-out '%{http_code}')
+    if [[ "$HEALTH_ORIGIN_INSECURE" == "1" ]]; then
+        args+=(--insecure)
+    fi
+    if [[ -n "$HEALTH_ORIGIN_CACERT" ]]; then
+        args+=(--cacert "$HEALTH_ORIGIN_CACERT")
+    fi
+    ORIGIN_RC=0
+    ORIGIN_CODE="$(curl "${args[@]}" "$url" 2>"$tmp/origin.err")" || ORIGIN_RC=$?
+    [[ "$ORIGIN_CODE" =~ ^[0-9]{3}$ ]] || ORIGIN_CODE="000"
+}
+
+# Request exactly as a visitor / Cloudflare-fronted client would make it.
+# Sets PUB_CODE / PUB_RC and PUB_CLASS, one of:
+#   OK               2xx/3xx
+#   CF_CHALLENGE     Cloudflare challenge ("Just a moment", cf-mitigated)
+#   CF_BLOCK         Cloudflare WAF block / rate limit (1020, 1015, 429)
+#   CF_ORIGIN_ERROR  Cloudflare 520-527/530: Cloudflare cannot use the origin
+#   CONN_FAIL        no HTTP answer at all (DNS, TCP, TLS, timeout)
+#   HTTP_ERROR       any other 4xx/5xx
+public_probe() {
+    local url="$1" tmp="$2" hdr="$2/pub.hdr" body="$2/pub.body"
+    local snippet="" cf=0 mitigated=0 chal_body=0 waf_body=0
+    : > "$hdr"; : > "$body"
+    PUB_RC=0
+    PUB_CODE="$(curl --location --silent --show-error --output "$body" --dump-header "$hdr" \
+        --connect-timeout 10 --max-time 30 --write-out '%{http_code}' "$url" 2>"$tmp/pub.err")" || PUB_RC=$?
+    [[ "$PUB_CODE" =~ ^[0-9]{3}$ ]] || PUB_CODE="000"
+
+    PUB_CLASS="HTTP_ERROR"
+    if [[ "$PUB_RC" -ne 0 ]]; then
+        PUB_CLASS="CONN_FAIL"
+        return 0
+    fi
+
+    if grep -Eqi '^(server:[[:space:]]*cloudflare|cf-ray:)' "$hdr"; then cf=1; fi
+    if grep -Eqi '^cf-mitigated:[[:space:]]*challenge' "$hdr"; then mitigated=1; fi
+    snippet="$(head -c 8192 "$body" | tr -d '\000' || true)"
+    if grep -Eqi 'Just a moment|cf-chl|challenge-platform|cf_chl_opt' <<<"$snippet"; then chal_body=1; fi
+    if grep -Eqi 'error code: 10[0-9]{2}|Attention Required|Cloudflare Ray ID' <<<"$snippet"; then waf_body=1; fi
+
+    if [[ "$mitigated" -eq 1 ]] || [[ "$PUB_CODE" =~ ^(403|503)$ && "$chal_body" -eq 1 ]]; then
+        PUB_CLASS="CF_CHALLENGE"
+    elif [[ "$cf" -eq 1 && ( "$PUB_CODE" == "429" || ( "$PUB_CODE" == "403" && "$waf_body" -eq 1 ) ) ]]; then
+        PUB_CLASS="CF_BLOCK"
+    elif [[ "$cf" -eq 1 && "$PUB_CODE" =~ ^5(2[0-7]|30)$ ]]; then
+        PUB_CLASS="CF_ORIGIN_ERROR"
+    elif [[ "$PUB_CODE" =~ ^[23][0-9]{2}$ ]]; then
+        PUB_CLASS="OK"
+    fi
+}
+
+# Checks one URL, logs the evidence and a verdict. Returns 0 = no problem
+# (a probe blocked by Cloudflare while the origin is healthy is a warning
+# only), 1 = problem. Must not rely on set -e (called with "||").
+http_check_url() {
+    local url="$1" tmp="$2" do_origin="$3"
+    local host port origin_ok=0 have_origin=0 o_note="" p_note="" why=""
+
+    if ! parse_url "$url"; then
+        log "WARNING: not an http(s) URL with a plain host name: $url"
+        return 1
+    fi
+    host="$URL_HOST"; port="$URL_PORT"
+    log "HTTP check: $url"
+
+    if [[ "$do_origin" -eq 1 ]]; then
+        if host_is_ip "$host"; then
+            log "  origin check skipped: the URL host is an address, not a name"
+        else
+            have_origin=1
+            origin_probe "$url" "$host" "$port" "$tmp"
+            if [[ "$ORIGIN_RC" -eq 0 && "$ORIGIN_CODE" =~ ^[23][0-9][0-9]$ ]]; then
+                origin_ok=1
+            fi
+            if [[ "$ORIGIN_RC" -ne 0 ]]; then o_note=" - $(curl_rc_text "$ORIGIN_RC")"; fi
+            log "  origin (--resolve ${host}:${port}:${HEALTH_ORIGIN_IP}): HTTP ${ORIGIN_CODE}${o_note}"
+        fi
+    fi
+
+    public_probe "$url" "$tmp"
+    if [[ "$PUB_RC" -ne 0 ]]; then p_note=" - $(curl_rc_text "$PUB_RC")"; fi
+    log "  public (DNS/Cloudflare path)              : HTTP ${PUB_CODE} [${PUB_CLASS}]${p_note}"
+
+    # ---- origin check not available: public result only ----
+    if [[ "$have_origin" -eq 0 ]]; then
+        case "$PUB_CLASS" in
+            OK)
+                log "  RESULT: OK (public URL only; the origin was not checked separately)."
+                return 0 ;;
+            CF_CHALLENGE|CF_BLOCK)
+                log "  RESULT: PROBE BLOCKED by Cloudflare (HTTP ${PUB_CODE}, ${PUB_CLASS})."
+                log "          Without the origin check this cannot be told apart from an outage."
+                return 1 ;;
+            CF_ORIGIN_ERROR)
+                log "  RESULT: PROBLEM: Cloudflare returned ${PUB_CODE}; it cannot use the origin."
+                return 1 ;;
+            *)
+                log "  RESULT: PROBLEM: public URL failed (HTTP ${PUB_CODE})."
+                return 1 ;;
+        esac
+    fi
+
+    # ---- origin healthy ----
+    if [[ "$origin_ok" -eq 1 ]]; then
+        case "$PUB_CLASS" in
+            OK)
+                log "  RESULT: OK - origin and public URL are both healthy."
+                return 0 ;;
+            CF_CHALLENGE|CF_BLOCK)
+                log "  RESULT: ORIGIN OK; this probe was BLOCKED by Cloudflare (HTTP ${PUB_CODE}, ${PUB_CLASS})."
+                log "          Nginx/WordPress answer correctly. This is not an outage."
+                log "          For a public check, add a Cloudflare WAF skip rule for this server's IP."
+                return 0 ;;
+            CF_ORIGIN_ERROR)
+                log "  RESULT: PROBLEM between Cloudflare and the origin: origin is fine locally (HTTP ${ORIGIN_CODE}),"
+                log "          but Cloudflare returns ${PUB_CODE}. Check: firewall blocking Cloudflare IP ranges,"
+                log "          SSL/TLS mode vs the origin certificate, origin port, DNS pointing to another server."
+                return 1 ;;
+            CONN_FAIL)
+                log "  RESULT: PROBLEM: origin is fine (HTTP ${ORIGIN_CODE}) but the public URL is unreachable from this server"
+                log "          (DNS, network or Cloudflare)."
+                return 1 ;;
+            *)
+                log "  RESULT: PROBLEM: origin says HTTP ${ORIGIN_CODE} but the public URL says HTTP ${PUB_CODE};"
+                log "          check Cloudflare rules, redirects, caching and page rules."
+                return 1 ;;
+        esac
+    fi
+
+    # ---- origin failed ----
+    why="$(origin_failure_text)"
+    case "$PUB_CLASS" in
+        OK)
+            log "  RESULT: ORIGIN CHECK FAILED (${why}) although the public URL answers."
+            log "          Cloudflare may be serving a cached copy, or --origin-ip / port / TLS settings"
+            log "          do not match this server. Do not trust the public result until this is clear."
+            return 1 ;;
+        CF_CHALLENGE|CF_BLOCK)
+            log "  RESULT: ORIGIN CHECK FAILED (${why}); the public probe was also blocked by Cloudflare,"
+            log "          so there is no public confirmation either."
+            return 1 ;;
+        *)
+            log "  RESULT: ORIGIN DOWN (${why}); the public URL fails too (HTTP ${PUB_CODE})."
+            log "          The fault is in Nginx / PHP-FPM / WordPress, not in Cloudflare."
+            return 1 ;;
+    esac
+}
+
 health() {
     require_commands nginx systemctl journalctl
-    local rc=0 url http_code curl_rc
+    local rc=0 url tmp check_origin=1
+    local urls=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --origin-ip)
+                [[ $# -ge 2 ]] || die "--origin-ip needs an IP address."
+                HEALTH_ORIGIN_IP="$2"; shift 2 ;;
+            --no-origin)       check_origin=0; shift ;;
+            --insecure-origin) HEALTH_ORIGIN_INSECURE=1; shift ;;
+            --)                shift; urls+=("$@"); break ;;
+            -*)                die "Unknown health option: $1" ;;
+            *)                 urls+=("$1"); shift ;;
+        esac
+    done
+    [[ "$HEALTH_ORIGIN_IP" =~ ^[0-9A-Fa-f:.]+$ ]] || die "Invalid origin IP: $HEALTH_ORIGIN_IP"
+    [[ "$HEALTH_ORIGIN_INSECURE" =~ ^[01]$ ]] || die "HEALTH_ORIGIN_INSECURE must be 0 or 1."
+    [[ -z "$HEALTH_ORIGIN_CACERT" || -r "$HEALTH_ORIGIN_CACERT" ]] \
+        || die "Cannot read HEALTH_ORIGIN_CACERT: $HEALTH_ORIGIN_CACERT"
+    if [[ "${#urls[@]}" -eq 0 && -n "$HEALTH_URLS" ]]; then
+        read -r -a urls <<<"$HEALTH_URLS"
+    fi
 
     log "Nginx version:"
     nginx -v 2>&1 || rc=1
@@ -692,26 +968,16 @@ health() {
     log "Listening sockets:"
     check_listeners || rc=1
 
-    if [[ "$#" -gt 0 ]]; then
-        require_commands curl
-        for url in "$@"; do
-            log "HTTP check: $url"
-            http_code="000"
-            set +e
-            http_code="$(curl --location --silent --show-error --output /dev/null \
-                --connect-timeout 10 --max-time 30 \
-                --write-out '%{http_code}' "$url")"
-            curl_rc=$?
-            set -e
-            log "HTTP ${http_code}"
-            if [[ "$curl_rc" -ne 0 ]] || [[ ! "$http_code" =~ ^[0-9]{3}$ ]] \
-                || (( 10#$http_code < 200 || 10#$http_code >= 400 )); then
-                log "WARNING: URL check failed (curl exit=${curl_rc}, HTTP=${http_code}): $url"
-                rc=1
-            fi
+    if [[ "${#urls[@]}" -gt 0 ]]; then
+        require_commands curl mktemp
+        tmp="$(mktemp -d)" || die "Cannot create a temporary directory."
+        for url in "${urls[@]}"; do
+            http_check_url "$url" "$tmp" "$check_origin" || rc=1
         done
+        rm -rf "$tmp"
     else
         log "No URL supplied. Example: $0 health https://example.com"
+        log "(the origin is checked directly via --resolve ${HEALTH_ORIGIN_IP}; the public path via DNS/Cloudflare)"
     fi
 
     log "Recent Nginx errors (if any):"
@@ -897,7 +1163,7 @@ menu_choose() {
     local choice url dir
     echo
     echo "======================================"
-    echo " NGINX MAINTENANCE TOOLKIT (v13)"
+    echo " NGINX MAINTENANCE TOOLKIT (v14)"
     echo "======================================"
     echo "1) Backup configuration"
     echo "2) Upgrade Nginx (backup + simulation + confirmation)"
@@ -931,12 +1197,15 @@ menu_choose() {
 
 usage() {
     cat <<EOF
-NGINX MAINTENANCE TOOLKIT (v13)
+NGINX MAINTENANCE TOOLKIT (v14)
 
 Usage:
   sudo $0 backup
   sudo $0 upgrade
-  sudo $0 health [https://domain.example ...]
+  sudo $0 health [options] [https://domain.example ...]
+      --origin-ip IP      address of the origin for the direct check (default 127.0.0.1)
+      --no-origin         skip the direct origin check
+      --insecure-origin   do not verify the origin TLS certificate
   sudo $0 list
   sudo $0 rollback [backup-name-or-path]
   sudo $0 menu
@@ -947,6 +1216,9 @@ Log root:    $LOG_ROOT
 Environment:
   HEALTH_PORTS="80 443"   optional; ports Nginx must be listening on
                           (default: any TCP listener owned by nginx)
+  HEALTH_URLS="https://example.com/ ..."   URLs checked when none are given
+                          (also used at the end of "upgrade")
+  HEALTH_ORIGIN_IP, HEALTH_ORIGIN_INSECURE=1, HEALTH_ORIGIN_CACERT=/path/ca.pem
 EOF
 }
 
