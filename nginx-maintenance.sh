@@ -1,29 +1,28 @@
 #!/usr/bin/env bash
 # ============================================================
-# NGINX MAINTENANCE TOOLKIT (v8)
+# NGINX MAINTENANCE TOOLKIT (v9)
 # Ubuntu 24.04+ / Debian-based systems / APT Nginx packages
 #
 # Commands:
 #   backup       Backup Nginx config and related system settings
 #   upgrade      Backup, refresh APT, simulate, confirm, upgrade
 #   health       Check config, service, listeners and optional URLs
-#   list         List available backups and their validation status
+#   list         List backups and their status
 #   rollback     Restore configuration from a trusted backup
 #   menu         Interactive menu
 #
-# v8 audit fixes:
-# - Match TCP ports accurately across IPv4/IPv6/wildcard addresses in
-#   check_listeners() regardless of whitespace alignment.
-# - Log a clear warning when "nginx -T" writes non-empty stderr to
-#   nginx-T-errors.txt during backup.
-# - Surface non-zero return codes from rollback_apply() explicitly
-#   in rollback() so callers/logs see exact failure/revert status.
-#
-# v7 changes:
-# - Separate stdout and stderr of "nginx -T" so warnings/errors do
-#   not pollute parsed config/SSL/include files.
-# - Keep global TIMESTAMP immutable; use local timestamps in functions.
-# - Add "list" command (and menu option) to inspect backups.
+# v9 = merge of two lines of work.
+# From v8: immutable RUN_TIMESTAMP + local timestamps; "nginx -T" stdout
+#   and stderr kept apart; "list" command; rollback return codes 4/5
+#   logged and propagated to a final "Finished (exit code N)" line.
+# Kept/fixed from v6-v7: atomic backups (.tmp-<ts> then rename),
+#   CONFIG_INVALID marking, separate retention quotas, start-if-stopped,
+#   signal protection during the /etc/nginx swap, mv -T hardening.
+# Merge fixes: because rollback is now called with "|| EXIT_CODE=$?",
+#   set -e is ignored inside it, so every critical step carries its own
+#   explicit check (safety copy, backup path validation). The "nginx -T"
+#   stderr warning ignores nginx's normal "syntax is ok / test is
+#   successful" lines, which are printed on every successful run.
 #
 # IMPORTANT:
 # - This is not a zero-downtime upgrade guarantee. APT package
@@ -135,27 +134,28 @@ list_backups() {
         return 0
     fi
 
-    log "Available backups in $BACKUP_ROOT:"
-    printf '%-28s %-16s %s\n' "BACKUP_DIR" "STATUS" "NGINX_VERSION"
-    printf '%-28s %-16s %s\n' "----------" "------" "-------------"
-
+    log "Backups in $BACKUP_ROOT (newest first; give rollback the name or full path):"
+    printf '%-34s %-15s %s\n' "BACKUP" "STATUS" "NGINX_PACKAGE"
     while IFS= read -r item; do
         [[ -n "$item" ]] || continue
         found=1
-        name="$(basename "$item")"
+        name="${item##*/}"
         if [[ ! -d "$item/nginx" ]]; then
             status="INCOMPLETE"
         elif [[ -e "$item/CONFIG_INVALID" ]]; then
             status="CONFIG_INVALID"
+        elif [[ "$name" == before-rollback-* ]]; then
+            status="SAFETY_COPY"
         else
             status="VALID"
         fi
         pkg_ver="unknown"
         if [[ -f "$item/nginx-main-package.txt" ]]; then
-            pkg_ver="$(awk '{print $2}' "$item/nginx-main-package.txt" | head -n1)"
+            # File format is "<package><TAB><version>"; an error text has no TAB.
+            pkg_ver="$(awk -F'\t' 'NF >= 2 { print $2; exit }' "$item/nginx-main-package.txt" 2>/dev/null || true)"
             [[ -n "$pkg_ver" ]] || pkg_ver="unknown"
         fi
-        printf '%-28s %-16s %s\n' "$item" "$status" "$pkg_ver"
+        printf '%-34s %-15s %s\n' "$name" "$status" "$pkg_ver"
     done < <(
         find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d \
             \( -name '[0-9]*-[0-9]*' -o -name 'before-rollback-*' \) 2>/dev/null \
@@ -221,37 +221,39 @@ reload_or_start_nginx() {
 
 # ---------- save helpers ----------
 
+# These return 1 on any failure instead of relying on set -e, because
+# rollback calls them in a context where set -e is ignored.
 save_systemd_state() {
     local destination="$1"
-    mkdir -p "$destination/systemd"
+    mkdir -p "$destination/systemd" || return 1
     if [[ -d /etc/systemd/system/nginx.service.d ]]; then
-        cp -a /etc/systemd/system/nginx.service.d "$destination/systemd/"
+        cp -a /etc/systemd/system/nginx.service.d "$destination/systemd/" || return 1
     else
-        touch "$destination/systemd/NO_NGINX_OVERRIDE_PRESENT"
+        touch "$destination/systemd/NO_NGINX_OVERRIDE_PRESENT" || return 1
     fi
     # Full unit override (or mask symlink) in /etc/systemd/system.
     if [[ -e /etc/systemd/system/nginx.service || -L /etc/systemd/system/nginx.service ]]; then
-        cp -a /etc/systemd/system/nginx.service "$destination/systemd/nginx.service"
+        cp -a /etc/systemd/system/nginx.service "$destination/systemd/nginx.service" || return 1
     else
-        touch "$destination/systemd/NO_NGINX_UNIT_PRESENT"
+        touch "$destination/systemd/NO_NGINX_UNIT_PRESENT" || return 1
     fi
 }
 
 save_logrotate_state() {
     local destination="$1"
     if [[ -f /etc/logrotate.d/nginx ]]; then
-        cp -a /etc/logrotate.d/nginx "$destination/logrotate-nginx"
+        cp -a /etc/logrotate.d/nginx "$destination/logrotate-nginx" || return 1
     else
-        touch "$destination/NO_LOGROTATE_NGINX_PRESENT"
+        touch "$destination/NO_LOGROTATE_NGINX_PRESENT" || return 1
     fi
 }
 
 save_default_state() {
     local destination="$1"
     if [[ -f /etc/default/nginx ]]; then
-        cp -a /etc/default/nginx "$destination/default-nginx"
+        cp -a /etc/default/nginx "$destination/default-nginx" || return 1
     else
-        touch "$destination/NO_DEFAULT_NGINX_PRESENT"
+        touch "$destination/NO_DEFAULT_NGINX_PRESENT" || return 1
     fi
 }
 
@@ -308,15 +310,15 @@ restore_default_from() {
 
 save_current_state() {
     local destination="$1"
-    mkdir -p "$destination"
+    mkdir -p "$destination" || return 1
     if [[ -d /etc/nginx ]]; then
-        cp -a /etc/nginx "$destination/"
+        cp -a /etc/nginx "$destination/" || return 1
     else
         die "/etc/nginx does not exist; refusing to continue."
     fi
-    save_systemd_state "$destination"
-    save_logrotate_state "$destination"
-    save_default_state "$destination"
+    save_systemd_state "$destination" || return 1
+    save_logrotate_state "$destination" || return 1
+    save_default_state "$destination" || return 1
 }
 
 restore_auxiliary_state() {
@@ -382,10 +384,13 @@ backup() {
 
     log "Saving Nginx build information and expanded configuration..."
     nginx -V > "$work/nginx-build-info.txt" 2>&1 || true
-    # Keep stdout clean for config parsing; save stderr separately.
+    # Keep stdout clean for config parsing; stderr goes to its own file.
     nginx -T > "$work/nginx-full-config.txt" 2> "$work/nginx-T-errors.txt" || true
-    if [[ -s "$work/nginx-T-errors.txt" ]]; then
-        log "WARNING: 'nginx -T' emitted messages to stderr; see $CURRENT_BACKUP/nginx-T-errors.txt"
+    # On success nginx still prints "syntax is ok" / "test is successful"
+    # to stderr, so only other lines are worth a warning.
+    if grep -Ev '^nginx: (the configuration file .* syntax is ok|configuration file .* test is successful)$' \
+        "$work/nginx-T-errors.txt" >/dev/null 2>&1; then
+        log "WARNING: 'nginx -T' reported warnings/errors; see $CURRENT_BACKUP/nginx-T-errors.txt"
     fi
 
     log "Recording SSL certificate/key paths referenced by Nginx config..."
@@ -549,8 +554,8 @@ check_listeners() {
     if [[ -n "$HEALTH_PORTS" ]]; then
         for port in $HEALTH_PORTS; do
             [[ "$port" =~ ^[0-9]+$ ]] || die "Invalid port in HEALTH_PORTS: $port"
-            # Match ":<port>" at the end of a field/address token (e.g. 0.0.0.0:80, [::]:443, *:8080).
-            matched="$(grep -E "(^|[[:space:]])(\[[0-9a-fA-F:.]+\]|[^[:space:]]*):${port}([[:space:]]|$)" <<<"$nginx_listeners" || true)"
+            # Local-address token ending in ":<port>" (0.0.0.0:80, [::]:443, *:8080).
+            matched="$(grep -E "(^|[[:space:]])[^[:space:]]*:${port}([[:space:]]|$)" <<<"$nginx_listeners" || true)"
             if [[ -z "$matched" ]]; then
                 log "WARNING: no Nginx listener on TCP port ${port}."
                 missing=1
@@ -624,6 +629,10 @@ health() {
 # so they remain visible even though this runs inside $(...).
 validate_backup_path() {
     local requested="$1" canonical_root canonical_backup
+    # A bare name (as shown by "list") is looked up inside the backup root.
+    if [[ "$requested" != */* ]]; then
+        requested="${BACKUP_ROOT}/${requested}"
+    fi
     [[ -d "$requested" ]] || die "Backup directory does not exist: $requested"
     canonical_root="$(realpath -e "$BACKUP_ROOT")" || die "Backup root does not exist."
     canonical_backup="$(realpath -e "$requested")" || die "Cannot resolve backup path."
@@ -654,7 +663,8 @@ rollback_apply() {
     failed_dir="/etc/nginx.failed-${ts}"
 
     log "Saving current state for automatic recovery..."
-    save_current_state "$safety_dir"
+    save_current_state "$safety_dir" \
+        || die "Could not save the pre-rollback safety copy. /etc/nginx is untouched."
     log "Safety copy: $safety_dir"
 
     log "Staging selected backup..."
@@ -755,11 +765,13 @@ rollback() {
     require_commands nginx systemctl realpath
     local requested="${1:-}" backup_dir answer rc=0
 
+    # No step here may rely on set -e: main/menu call rollback with
+    # "|| EXIT_CODE=$?", which disables it. Every failure is explicit.
     if [[ -z "$requested" ]]; then
-        requested="$(latest_backup)"
+        requested="$(latest_backup)" || requested=""
     fi
-    [[ -n "$requested" ]] || die "No valid backup found. Usage: $0 rollback /root/nginx-backups/TIMESTAMP"
-    backup_dir="$(validate_backup_path "$requested")"
+    [[ -n "$requested" ]] || die "No valid backup found. Usage: $0 rollback [name|path]  (see: $0 list)"
+    backup_dir="$(validate_backup_path "$requested")" || exit 1
     ensure_private_dir "$BACKUP_ROOT"
 
     echo "Selected backup: $backup_dir"
@@ -768,18 +780,15 @@ rollback() {
     [[ "${answer:-}" == "RESTORE" ]] || die "Rollback cancelled by user."
 
     # From here on, Ctrl-C / SIGTERM / SIGHUP (and SIGPIPE from a dead log
-    # pipe) must not interrupt the swap. rollback_apply is deliberately
-    # called plainly (no "||") so set -e stays active inside it, exactly as
-    # in v5: a failed safety copy aborts BEFORE /etc/nginx is touched.
-    # A non-zero return exits the script, so the traps need no cleanup there.
+    # pipe) must not interrupt the swap.
     trap '' INT TERM HUP PIPE
     rollback_apply "$backup_dir" || rc=$?
     trap - INT TERM HUP PIPE
 
     if [[ "$rc" -eq 4 ]]; then
-        log "Rollback reverted to pre-rollback state (code 4)."
+        log "Rollback failed validation and was reverted to the pre-rollback state (code 4)."
     elif [[ "$rc" -eq 5 ]]; then
-        log "Rollback encountered a critical state requiring manual intervention (code 5)."
+        log "Rollback hit a critical state that needs manual intervention (code 5)."
     fi
     return "$rc"
 }
@@ -788,12 +797,12 @@ menu() {
     local choice url dir
     echo
     echo "======================================"
-    echo " NGINX MAINTENANCE TOOLKIT (v8)"
+    echo " NGINX MAINTENANCE TOOLKIT (v9)"
     echo "======================================"
     echo "1) Backup configuration"
     echo "2) Upgrade Nginx (backup + simulation + confirmation)"
     echo "3) Health check"
-    echo "4) List available backups"
+    echo "4) List backups"
     echo "5) Rollback configuration"
     echo "0) Exit"
     echo
@@ -815,7 +824,7 @@ menu() {
         5)
             list_backups
             echo
-            read -r -p "Backup directory (Enter = latest valid): " dir || dir=""
+            read -r -p "Backup name or path (Enter = latest valid): " dir || dir=""
             if [[ -n "$dir" ]]; then
                 rollback "$dir" || EXIT_CODE=$?
             else
@@ -829,14 +838,14 @@ menu() {
 
 usage() {
     cat <<EOF
-NGINX MAINTENANCE TOOLKIT (v8)
+NGINX MAINTENANCE TOOLKIT (v9)
 
 Usage:
   sudo $0 backup
   sudo $0 upgrade
   sudo $0 health [https://domain.example ...]
   sudo $0 list
-  sudo $0 rollback [backup-directory]
+  sudo $0 rollback [backup-name-or-path]
   sudo $0 menu
 
 Backup root: $BACKUP_ROOT
