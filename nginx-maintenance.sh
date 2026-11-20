@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# NGINX MAINTENANCE TOOLKIT (v14)
+# NGINX MAINTENANCE TOOLKIT (v15)
 # Ubuntu 24.04+ / Debian-based systems / APT Nginx packages
 #
 # Commands:
@@ -78,6 +78,20 @@
 #   by the check at the end of "upgrade"), HEALTH_ORIGIN_IP,
 #   HEALTH_ORIGIN_INSECURE, HEALTH_ORIGIN_CACERT (Cloudflare Origin CA certs
 #   are not publicly trusted: use one of the last two for them).
+#
+# v15 changes (on top of v14):
+# - Normalize the distributed script to Unix LF line endings (CRLF breaks Bash).
+# - A healthy origin plus a Cloudflare challenge/WAF block is reported as
+#   "ORIGIN OK - PUBLIC ACCESS UNVERIFIED", not as a fully healthy public site.
+#   The health command remains non-failing for a probe-only block, but the log
+#   explicitly says that real visitor access has not been verified.
+# - Remove the blanket suggestion to skip Cloudflare WAF for the server IP.
+#   If a monitor exception is needed, scope it to a dedicated health endpoint,
+#   the monitor's public egress IP, and only the necessary security rule.
+# - Prefer HEALTH_ORIGIN_CACERT for Cloudflare Origin CA; reject combining it
+#   with --insecure-origin / HEALTH_ORIGIN_INSECURE=1 (which disables validation).
+# - Clarify that a successful public probe is only from this server's network
+#   path, not proof of availability from every visitor/location.
 #
 # IMPORTANT:
 # - This is not a zero-downtime upgrade guarantee. APT package
@@ -880,12 +894,23 @@ http_check_url() {
     if [[ "$origin_ok" -eq 1 ]]; then
         case "$PUB_CLASS" in
             OK)
-                log "  RESULT: OK - origin and public URL are both healthy."
+                log "  RESULT: ORIGIN OK + PUBLIC PROBE OK from this server's network path."
+                log "          This confirms this probe path only; it is not a guarantee for every visitor/location."
                 return 0 ;;
-            CF_CHALLENGE|CF_BLOCK)
-                log "  RESULT: ORIGIN OK; this probe was BLOCKED by Cloudflare (HTTP ${PUB_CODE}, ${PUB_CLASS})."
-                log "          Nginx/WordPress answer correctly. This is not an outage."
-                log "          For a public check, add a Cloudflare WAF skip rule for this server's IP."
+            CF_CHALLENGE)
+                log "  RESULT: ORIGIN OK - PUBLIC ACCESS UNVERIFIED."
+                log "          This probe received a Cloudflare challenge (HTTP ${PUB_CODE});"
+                log "          the origin answered HTTP ${ORIGIN_CODE}, but this does NOT prove"
+                log "          that ordinary visitors can access the public website."
+                log "          Health status: warning only; investigate the challenge separately."
+                return 0 ;;
+            CF_BLOCK)
+                log "  RESULT: ORIGIN OK - PUBLIC ACCESS UNVERIFIED."
+                log "          Cloudflare blocked/rate-limited this probe (HTTP ${PUB_CODE});"
+                log "          the origin answered HTTP ${ORIGIN_CODE}, but visitor access is unknown."
+                log "          Health status: warning only; investigate the WAF/rate limit separately."
+                log "          Do not bypass WAF globally. If needed, allow only a dedicated"
+                log "          health endpoint from the monitor egress IP using a narrow rule."
                 return 0 ;;
             CF_ORIGIN_ERROR)
                 log "  RESULT: PROBLEM between Cloudflare and the origin: origin is fine locally (HTTP ${ORIGIN_CODE}),"
@@ -943,6 +968,8 @@ health() {
     [[ "$HEALTH_ORIGIN_INSECURE" =~ ^[01]$ ]] || die "HEALTH_ORIGIN_INSECURE must be 0 or 1."
     [[ -z "$HEALTH_ORIGIN_CACERT" || -r "$HEALTH_ORIGIN_CACERT" ]] \
         || die "Cannot read HEALTH_ORIGIN_CACERT: $HEALTH_ORIGIN_CACERT"
+    [[ "$HEALTH_ORIGIN_INSECURE" != "1" || -z "$HEALTH_ORIGIN_CACERT" ]] \
+        || die "Choose either HEALTH_ORIGIN_CACERT or --insecure-origin, not both. Prefer the CA certificate."
     if [[ "${#urls[@]}" -eq 0 && -n "$HEALTH_URLS" ]]; then
         read -r -a urls <<<"$HEALTH_URLS"
     fi
@@ -1163,7 +1190,7 @@ menu_choose() {
     local choice url dir
     echo
     echo "======================================"
-    echo " NGINX MAINTENANCE TOOLKIT (v14)"
+    echo " NGINX MAINTENANCE TOOLKIT (v15)"
     echo "======================================"
     echo "1) Backup configuration"
     echo "2) Upgrade Nginx (backup + simulation + confirmation)"
@@ -1197,7 +1224,7 @@ menu_choose() {
 
 usage() {
     cat <<EOF
-NGINX MAINTENANCE TOOLKIT (v14)
+NGINX MAINTENANCE TOOLKIT (v15)
 
 Usage:
   sudo $0 backup
@@ -1219,6 +1246,8 @@ Environment:
   HEALTH_URLS="https://example.com/ ..."   URLs checked when none are given
                           (also used at the end of "upgrade")
   HEALTH_ORIGIN_IP, HEALTH_ORIGIN_INSECURE=1, HEALTH_ORIGIN_CACERT=/path/ca.pem
+  Prefer HEALTH_ORIGIN_CACERT for Cloudflare Origin CA; do not combine it with
+  HEALTH_ORIGIN_INSECURE=1 / --insecure-origin (certificate verification off).
 EOF
 }
 
