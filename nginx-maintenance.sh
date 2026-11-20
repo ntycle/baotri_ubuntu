@@ -99,7 +99,7 @@
 #   reference into external-includes/ but are NOT restored.
 # - Backups may contain credentials/private configuration. Keep
 #   /root/nginx-backups private and maintain an off-server snapshot.
-# ============================================================
+# ============================================================[cite: 1]
 
 set -Eeuo pipefail
 umask 077
@@ -1285,10 +1285,10 @@ main() {
     fi
 
     case "$cmd" in
-        backup)   backup ;;
-        upgrade)  upgrade ;;
+        backup)   backup || EXIT_CODE=$? ;;
+        upgrade)  upgrade || EXIT_CODE=$? ;;
         health)   shift; health "$@" || EXIT_CODE=$? ;;
-        list)     list_backups ;;
+        list)     list_backups || EXIT_CODE=$? ;;
         rollback) shift; rollback "${1:-}" || EXIT_CODE=$? ;;
         *)        usage; die "Unknown command: $cmd" ;;
     esac
